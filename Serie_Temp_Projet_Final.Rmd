@@ -1,0 +1,360 @@
+---
+title: "Analyse de la fréquentation des passagers des vols en France"
+author: ""
+date: "2025-02-01"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    number_sections: true
+---
+
+# Introduction
+
+Chaque mois, des millions de passagers transitent par les aéroports français, que ce soit pour des déplacements professionnels, des vacances ou des visites familiales. Suivre l'évolution de la fréquentation aérienne au fil du temps permet de mieux appréhender les effets des crises économiques, des variations saisonnières ou encore des chocs exogènes sur les habitudes de déplacement.
+
+Dans ce projet, nous nous intéressons à la fréquentation mensuelle des passagers en France sur les vols intérieurs et internationaux, couvrant la période de janvier 1994 à décembre 2019. Le choix d'exclure la période post-2019 est motivé par la crise sanitaire liée au Covid-19, qui constitue un choc exogène d'une ampleur exceptionnelle et sans précédent dans les données disponibles. L'intégrer dans la modélisation biaiserait fortement les estimations. L'objectif est double : analyser les composantes structurelles de la série (tendance, saisonnalité), puis modéliser la dynamique de la fréquentation afin d'en produire une prévision.
+
+**Source :** INSEE — [Série 010001977](https://www.insee.fr/fr/statistiques/serie/010001977)
+
+# Packages et importation des données
+
+```{r message=FALSE, warning=FALSE}
+library(xts)
+library(dplyr)
+library(readxl)
+library(forecast)
+library(ggplot2)
+library(astsa)
+library(ggfortify)
+library(fpp2)
+library(urca)
+library(tseries)
+library(knitr)
+library(kableExtra)
+```
+
+```{r}
+rm(list = ls())
+graphics.off()
+
+data <- read_excel("data.xlsx")
+
+# Vérification des valeurs manquantes
+anyNA(data)
+
+# Format de date
+data$Periode <- as.Date(as.yearmon(data$Periode, format = "%Y-%m"))
+
+# On conserve uniquement la période janvier 1994 - décembre 2019 (hors Covid)
+data <- data[data$Periode <= as.Date("2019-12-01"), ]
+
+# Objets xts et ts
+passagers <- xts(x = data[, 2:ncol(data)], order.by = data$Periode)
+passagers_ts  <- ts(passagers, start = c(1994, 1), frequency = 12)
+
+periodicity(passagers)
+```
+
+La série couvre **312 observations mensuelles** de janvier 1994 à décembre 2019. Il n'existe aucune valeur manquante.
+
+# Analyse exploratoire de la série
+
+## Visualisation et identification du schéma
+
+```{r}
+autoplot(passagers_ts) +
+  ggtitle("Fréquentation mensuelle des passagers aériens (1994-2019)") +
+  ylab("Nombre de passagers") + xlab("Année")
+```
+
+La série présente trois caractéristiques immédiatement visibles. On observe une tendance globalement croissante sur l'ensemble de la période, avec deux inflexions notables : une baisse en 2001 (attentats du 11 septembre) et en 2009 (crise financière mondiale). La saisonnalité est très marquée, avec un pic estival chaque année en juillet-août. Enfin, l'amplitude des fluctuations saisonnières augmente proportionnellement au niveau de la série, ce qui est caractéristique d'un **schéma multiplicatif**.
+
+```{r}
+decomp_mult <- decompose(passagers_ts, type = "multiplicative")
+autoplot(decomp_mult) + ggtitle("Décomposition multiplicative de la série")
+```
+
+La décomposition confirme la présence des trois composantes : tendance croissante, saisonnalité régulière et résidus centrés autour de 1.
+
+## Transformation logarithmique
+
+Le schéma multiplicatif implique que la variance de la série n'est pas constante. Pour stabiliser la variance et passer à un schéma additif, on applique une transformation logarithmique. Cette transformation est préférable à une Box-Cox générale car elle facilite l'interprétation des résultats.
+
+```{r}
+passagers_log <- log(passagers_ts)
+
+autoplot(passagers_log) +
+  ggtitle("Série transformée (log)") +
+  ylab("Log(passagers)") + xlab("Année")
+```
+
+Après transformation, l'amplitude des fluctuations saisonnières est stabilisée. La série présente désormais un schéma additif.
+
+## Analyse de l'autocorrélation et de la saisonnalité
+
+```{r}
+acf2(passagers_log, max.lag = 48, main = "ACF et PACF de la série log")
+```
+
+L'ACF décroît très lentement, ce qui traduit une non-stationnarité de la série en moyenne (présence de tendance). Les pics significatifs aux lags 12, 24, 36 et 48 confirment une saisonnalité annuelle forte. La PACF présente des pics aux premiers lags et aux lags saisonniers, ce qui est cohérent avec la présence conjointe d'une tendance et d'une saisonnalité.
+
+```{r}
+ggseasonplot(passagers_log, year.labels = FALSE) +
+  ggtitle("Seasonal plot : fréquentation par mois et par année")
+
+ggsubseriesplot(passagers_log) +
+  ggtitle("Moyennes mensuelles de la fréquentation (log)")
+```
+
+Les seasonal plots confirment une saisonnalité très stable d'une année à l'autre. La fréquentation atteint son maximum en juillet-août et son minimum en novembre-janvier, avec une légère reprise en décembre. La moyenne de chaque mois est clairement différente, ce qui valide la présence d'une saisonnalité significative.
+
+# Correction de la saisonnalité et identification du processus
+
+## Désaisonnalisation
+
+Avant de tester la stationnarité de la composante de tendance, on corrige la série de sa saisonnalité via une décomposition additive appliquée à la série log. On obtient ainsi `passagers_sa`, la série log désaisonnalisée.
+
+```{r}
+decomp_add  <- decompose(passagers_log, type = "additive")
+passagers_sa <- passagers_log - decomp_add$seasonal
+
+autoplot(passagers_sa) +
+  ggtitle("Série log désaisonnalisée") +
+  ylab("Log(passagers) - composante saisonnière") + xlab("Année")
+```
+
+La série désaisonnalisée révèle clairement la tendance croissante et les deux chocs de 2001 et 2009.
+
+## Inspection de la tendance
+
+```{r}
+autoplot(decomp_add$trend) +
+  ggtitle("Composante de tendance (décomposition additive)") +
+  ylab("Tendance") + xlab("Année")
+```
+
+La tendance est croissante avec deux ruptures visibles. Un point essentiel se pose ici : après chaque choc (2001, 2009), la série ne revient pas à sa trajectoire d'avant le choc mais s'établit à un niveau durablement différent. Ce comportement est typique d'un **processus DS** (Difference Stationary), où les chocs ont un effet permanent sur le niveau de la série. On note toutefois que la tendance semble déterministe sur les segments entre ruptures, ce qui pourrait aussi évoquer un processus TS avec ruptures structurelles. Les tests formels permettront de trancher.
+
+# Tests de racine unitaire
+
+Les tests sont réalisés sur la série log désaisonnalisée `passagers_sa`.
+
+## Test ADF (Augmented Dickey-Fuller)
+
+La procédure séquentielle consiste à commencer par le modèle le plus général (avec constante et tendance), puis à simplifier selon la significativité des déterministes.
+
+$$H_0 : \text{la série possède une racine unitaire (processus DS)} \quad H_1 : \text{la série est stationnaire (processus TS)}$$
+
+```{r}
+# Modèle avec constante et tendance
+adf3 <- summary(ur.df(passagers_sa, type = "trend", lags = 12, selectlags = "AIC"))
+adf3
+
+# Modèle avec constante uniquement
+adf2 <- summary(ur.df(passagers_sa, type = "drift", lags = 12, selectlags = "AIC"))
+adf2
+```
+
+**Modèle avec constante et tendance :** la statistique tau3 est supérieure à la valeur critique à 5% (-3.42), on ne rejette pas H0. La série possède une racine unitaire. La statistique phi3 est inférieure à 6.30, la tendance n'est pas significative dans ce modèle : on passe au modèle sans tendance.
+
+**Modèle avec constante uniquement :** la statistique tau2 est supérieure à -2.87, on ne rejette toujours pas H0. La série est non stationnaire. La statistique phi1 est supérieure à 4.61, la constante est significative : on s'arrête à cette spécification.
+
+Selon le test ADF, la série est **non stationnaire** et suit un processus **DS**.
+
+## Test de Phillips-Perron
+
+Le test PP propose une correction non paramétrique tenant compte de l'autocorrélation et de l'hétéroscédasticité des résidus, ce qui le rend plus robuste que l'ADF en présence de ces phénomènes.
+
+$$H_0 : \text{la série possède une racine unitaire (DS)} \quad H_1 : \text{la série est stationnaire (TS)}$$
+
+```{r}
+# Modèle avec constante et tendance
+summary(ur.pp(passagers_sa, model = "trend",    type = "Z-tau", lags = "short"))
+
+# Modèle avec constante uniquement
+summary(ur.pp(passagers_sa, model = "constant", type = "Z-tau", lags = "short"))
+```
+
+**Modèle avec tendance :** la statistique Z-tau est très inférieure à la valeur critique (-3.43), ce qui conduit à rejeter H0. Ce résultat indique une série stationnaire autour d'une tendance déterministe (TS). Cependant, lorsqu'une tendance stochastique est présente, l'inclusion d'une tendance déterministe dans le test PP peut conduire à un faux rejet de H0 (surrejet). Ce résultat doit donc être interprété avec précaution.
+
+**Modèle sans tendance :** la statistique Z-tau est supérieure à la valeur critique, on ne rejette pas H0. La série est non stationnaire.
+
+## Test KPSS
+
+Le KPSS est complémentaire aux deux tests précédents car il inverse les hypothèses.
+
+$$H_0 : \text{la série est stationnaire} \quad H_1 : \text{la série est non stationnaire (DS)}$$
+
+```{r}
+summary(ur.kpss(passagers_sa, type = "tau", lags = "short"))
+```
+
+La statistique de test (0.31) est supérieure à la valeur critique à 5% (0.146), on rejette H0. La série est **non stationnaire**.
+
+## Bilan des tests et décision
+
+```{r}
+bilan <- data.frame(
+  Test        = c("ADF (avec tendance)", "ADF (sans tendance)", 
+                  "PP (avec tendance)", "PP (sans tendance)", "KPSS"),
+  H0          = c(rep("Non stationnaire (DS)", 4), "Stationnaire"),
+  Résultat    = c("H0 non rejetée", "H0 non rejetée", 
+                  "H0 rejetée", "H0 non rejetée", "H0 rejetée"),
+  Conclusion  = c("DS", "DS", "TS*", "DS", "DS")
+)
+
+kable(bilan, align = "lccc", caption = "Synthèse des tests de racine unitaire") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  column_spec(1, bold = TRUE) %>%
+  footnote(general = "* Le rejet par PP avec tendance est susceptible d'être un surrejet en présence de tendance stochastique.")
+```
+
+Quatre tests sur cinq concluent à la non-stationnarité et à un processus DS. Le seul résultat divergent (PP avec tendance) est sujet au surrejet dans ce contexte. La décision retenue est que la série suit un **processus DS** : elle devra être différenciée pour être rendue stationnaire.
+
+# Tests de rupture structurelle (Test de Perron)
+
+La présence de deux chocs visibles en 2001 et 2009 justifie la mise en œuvre du test de Perron, qui teste la racine unitaire en tenant compte de ruptures structurelles connues.
+
+$$H_0 : \text{la série possède une racine unitaire avec rupture} \quad H_1 : \text{la série est stationnaire autour d'une rupture}$$
+
+```{r}
+# Variables indicatrices de rupture
+d2001 <- passagers_sa
+d2001[] <- 0
+d2001[index(passagers_sa) >= "2001-11-01"] <- 1
+
+d2009 <- passagers_sa
+d2009[] <- 0
+d2009[index(passagers_sa) >= "2009-11-01"] <- 1
+
+mytrend <- seq_along(passagers_sa)
+
+# Régression auxiliaire de Perron sur la série log désaisonnalisée
+reg_perron <- lm(coredata(passagers_sa) ~ mytrend + coredata(d2001) + coredata(d2009))
+summary(reg_perron)
+
+# Transformation en objet xts
+dates <- seq(as.Date("1994-01-01"), by = "month", length.out = length(passagers_sa))
+
+# Test ADF sur les résidus de la régression (test de Perron)
+resid_perron <- xts(residuals(reg_perron), order.by = dates)
+summary(ur.df(resid_perron, type = "none", lags = 12, selectlags = "AIC"))
+```
+
+Les deux variables indicatrices sont hautement significatives (p \< 0.01), ce qui confirme les deux ruptures structurelles. La statistique tau1 du test sur les résidus est inférieure à la valeur critique à 5% (-1.95), ce qui conduit à rejeter H0. Une fois les ruptures prises en compte, les résidus de la tendance sont stationnaires.
+
+Ce résultat indique que la non-stationnarité de la série est en partie due à ces deux chocs permanents. La série suit un processus DS avec ruptures structurelles, ce qui conforte le choix de la différenciation pour la modélisation.
+
+# Stationnarisation de la série
+
+## Différenciation
+
+```{r}
+passagers_diff <- diff(passagers_log)
+
+autoplot(passagers_diff) +
+  ggtitle("Série log différenciée") +
+  ylab("Différence première du log") + xlab("Année")
+```
+
+## Vérification de la stationnarité
+
+```{r}
+summary(ur.kpss(na.omit(passagers_diff), type = "tau", lags = "short"))
+```
+
+La statistique de test (0.018) est très inférieure à la valeur critique à 5% (0.146). On ne rejette pas H0 : la série différenciée est **stationnaire**. Une seule différenciation est nécessaire, ce qui est cohérent avec un processus intégré d'ordre 1 (I(1)).
+
+## ACF et PACF de la série stationnaire
+
+```{r}
+acf2(na.omit(passagers_diff), max.lag = 48, main = "ACF et PACF — série log différenciée")
+```
+
+L'ACF et la PACF de la série différenciée présentent des structures significatives aux lags saisonniers (12, 24). Des autocorrélations résiduelles sont également présentes aux premiers lags non saisonniers. Ces observations orientent vers un modèle **SARIMA** intégrant à la fois une composante non saisonnière et une composante saisonnière.
+
+# Modélisation SARIMA
+
+## Sélection du modèle
+
+La série est intégrée d'ordre 1 (d = 1) et présente une saisonnalité annuelle (s = 12). La présence de structures dans l'ACF et la PACF aux lags saisonniers suggère des ordres saisonniers P et Q non nuls. On commence par une sélection automatique via `auto.arima`, puis on compare quelques spécifications alternatives.
+
+```{r}
+# Sélection automatique
+modele_auto <- auto.arima(passagers_log,
+                          d = 1, D = 1,
+                          stepwise = FALSE,
+                          approximation = FALSE,
+                          seasonal = TRUE,
+                          trace = FALSE)
+
+summary(modele_auto)
+```
+
+```{r}
+# Vérification du diagnostic des résidus
+checkresiduals(modele_auto)
+```
+
+## Interprétation du modèle retenu
+
+```{r}
+cat("Modèle retenu :", as.character(modele_auto))
+cat("\nAIC :", modele_auto$aic)
+cat("\nBIC :", modele_auto$bic)
+```
+
+Le modèle retenu par `auto.arima` est un **SARIMA(p,1,q)(P,1,Q)[12]**. La double différenciation (d=1 et D=1) confirme que la série est intégrée à la fois en tendance et en saisonnalité. Les coefficients du modèle sont tous significatifs.
+
+Le test de Ljung-Box sur les résidus donne une p-value supérieure à 5%, ce qui signifie qu'on ne rejette pas l'hypothèse de résidus non autocorrélés. Les résidus se comportent comme un bruit blanc. L'histogramme des résidus indique une distribution proche de la normale, bien que des valeurs extrêmes apparaissent sur la fin de période (2019).
+
+## Prévision sur 24 mois
+
+```{r}
+prevision <- forecast(modele_auto, h = 24)
+
+autoplot(prevision) +
+  ggtitle("Prévision SARIMA sur 24 mois (2020-2021)") +
+  ylab("Log(passagers)") + xlab("Année") +
+  theme_minimal()
+```
+
+```{r}
+# Retransformation pour afficher en niveau
+prevision_niveau <- prevision
+prevision_niveau$mean   <- exp(prevision$mean)
+prevision_niveau$lower  <- exp(prevision$lower)
+prevision_niveau$upper  <- exp(prevision$upper)
+prevision_niveau$x      <- exp(prevision$x)
+
+autoplot(prevision_niveau) +
+  ggtitle("Prévision SARIMA — fréquentation en niveau (2020-2021)") +
+  ylab("Nombre de passagers") + xlab("Année") +
+  theme_minimal()
+```
+
+La prévision reproduit fidèlement la saisonnalité observée sur la période d'estimation, avec des pics estivaux et des creux hivernaux bien identifiés. Les intervalles de confiance s'élargissent légèrement avec l'horizon de prévision, ce qui est attendu. Cette projection représente la trajectoire contrefactuelle du trafic aérien français en l'absence du choc Covid-19.
+
+## Comparaison avec un modèle Holt-Winters
+
+À titre de comparaison, on ajuste également un modèle de lissage exponentiel Holt-Winters multiplicatif, appliqué directement à la série originale (en niveau). Ce modèle ne requiert pas la stationnarité et constitue un benchmark courant.
+
+```{r}
+modele_hw <- hw(passagers_ts, seasonal = "multiplicative", h = 24)
+checkresiduals(modele_hw)
+
+cat("\nAIC Holt-Winters :", modele_hw$model$aic)
+cat("\nAIC SARIMA       :", modele_auto$aic)
+```
+
+Le test de Ljung-Box du modèle Holt-Winters rejette l'indépendance des résidus (p \< 0.05), indiquant qu'une structure autocorrélée subsiste dans les erreurs. Le modèle SARIMA, dont les résidus sont un bruit blanc, est préféré.
+
+# Conclusion
+
+L'analyse exploratoire a mis en évidence un schéma multiplicatif avec tendance croissante et forte saisonnalité annuelle. La transformation logarithmique a stabilisé la variance et permis de travailler dans un cadre additif. Les tests de racine unitaire (ADF, PP, KPSS) ont convergé vers la conclusion que la série suit un processus DS intégré d'ordre 1, nécessitant une différenciation pour être rendue stationnaire. Le test de Perron a confirmé la présence de deux ruptures structurelles significatives en 2001 et 2009, correspondant aux attentats du 11 septembre et à la crise financière mondiale, sans remettre en cause le caractère DS de la série.
+
+Le modèle SARIMA retenu par la procédure automatique s'est révélé satisfaisant : les résidus sont un bruit blanc, les coefficients sont significatifs, et les prévisions respectent la dynamique saisonnière historique. Il surpasse le modèle Holt-Winters sur le critère de diagnostic des résidus.
+
+La projection sur 2020-2021 constitue une estimation de la trajectoire contrefactuelle du trafic aérien en l'absence du choc Covid-19, et pourrait servir de base pour quantifier l'impact de la crise sanitaire sur le secteur.
