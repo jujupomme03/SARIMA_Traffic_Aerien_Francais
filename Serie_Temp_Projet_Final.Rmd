@@ -3,6 +3,11 @@ title: "Analyse de la fréquentation des passagers des vols en France"
 author: ""
 date: "2025-02-01"
 output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    latex_engine: xelatex
   html_document:
     toc: true
     toc_float: true
